@@ -5570,6 +5570,38 @@ static NTSTATUS allocate_virtual_memory( void **ret, SIZE_T *size_ptr, ULONG typ
             else status = map_view( &view, base, size, type, vprot, limit_low, limit_high,
                                     align ? align - 1 : granularity_mask );
 
+            /* Some games reserve a huge arena up front (e.g. 256 GB) assuming the
+             * 128 TB address space of x86-64 Windows. On hosts with a 39-bit VA
+             * (common on Android arm64 kernels) the request cannot fit, and games
+             * that don't check the result crash. When WINE_CLAMP_HUGE_RESERVE is
+             * set, retry pure reservations > 16 GB at half the size until one fits.
+             * The caller sees the real, smaller size in *size_ptr. */
+            if (status == STATUS_NO_MEMORY && !base && !is_dos_memory &&
+                (type & MEM_RESERVE) && !(type & (MEM_COMMIT | MEM_RESERVE_PLACEHOLDER)) &&
+                size > ((SIZE_T)1 << 34))
+            {
+                static int clamp_enabled = -1;
+
+                if (clamp_enabled == -1)
+                {
+                    const char *e = getenv( "WINE_CLAMP_HUGE_RESERVE" );
+                    clamp_enabled = e && e[0] != '0';
+                }
+                if (clamp_enabled)
+                {
+                    SIZE_T try_size = size;
+
+                    while (status == STATUS_NO_MEMORY && (try_size >>= 1) >= ((SIZE_T)1 << 34))
+                        status = map_view( &view, base, try_size, type, vprot, limit_low, limit_high,
+                                           align ? align - 1 : granularity_mask );
+                    if (status == STATUS_SUCCESS)
+                    {
+                        FIXME( "clamped reservation of %#lx bytes to %#lx\n", size, try_size );
+                        size = try_size;
+                    }
+                }
+            }
+
             if (status == STATUS_SUCCESS)
             {
                 base = view->base;
